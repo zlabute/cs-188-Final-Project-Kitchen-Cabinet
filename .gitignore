@@ -18,3 +18,8 @@ MUJOCO_LOG.TXT
 
 # Lock files
 uv.lock
+
+
+# Runs
+tmp/
+diffusion_policy/

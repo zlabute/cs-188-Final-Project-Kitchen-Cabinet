@@ -1,49 +1,75 @@
-# Training configuration for the simple behavior cloning policy
-# For the full Diffusion Policy, use the official repo config instead.
-
-# Training parameters
-epochs: 100
-batch_size: 64
-learning_rate: 0.0001
-
-# Checkpoint saving
-checkpoint_dir: /tmp/cabinet_policy_checkpoints
-
 # ---------------------------------------------------------------
-# Reference: Official Diffusion Policy config keys
-# (used when training with the robocasa-benchmark/diffusion_policy repo)
-#
-# task: robocasa/OpenCabinet
-# horizon: 16             # prediction horizon (number of future actions)
-# n_obs_steps: 2          # number of observation steps as context
-# n_action_steps: 8       # number of actions to execute per step
-#
-# policy:
-#   type: diffusion_transformer
-#   n_layers: 8
-#   n_heads: 4
-#   d_model: 256
-#   noise_scheduler: ddpm
-#   num_diffusion_iters: 100
-#   num_inference_iters: 16
-#
-# training:
-#   batch_size: 192
-#   lr: 1.0e-4
-#   weight_decay: 1.0e-6
-#   num_epochs: 3000
-#   lr_scheduler: cosine
-#   lr_warmup_steps: 500
-#
-# observation:
-#   image_keys:
-#     - robot0_agentview_left_image
-#     - robot0_agentview_right_image
-#     - robot0_eye_in_hand_image
-#   low_dim_keys:
-#     - robot0_gripper_qpos
-#     - robot0_base_pos
-#     - robot0_base_quat
-#     - robot0_base_to_eef_pos
-#     - robot0_base_to_eef_quat
+# Diffusion UNet 1-D Low-Dim Policy  —  OpenCabinet
 # ---------------------------------------------------------------
+# Used by: 09_train_lowdim_unet.py, 07_evaluate_policy.py,
+#          08_visualize_policy_rollout.py
+#
+# obs_dim  = 16 (robot state) + 11 (handle features) = 27
+# action_dim = 12  (eef_pos 3, eef_rot 3, gripper 1, base 4, ctrl 1)
+#
+# Sized for CPU training on a laptop (~2.5M params).
+# For GPU training, scale up down_dims to [256, 512, 1024] and
+# increase batch_size / num_epochs accordingly.
+# ---------------------------------------------------------------
+
+obs_dim: 27
+action_dim: 12
+
+# Temporal horizons (in timesteps @ 20 Hz)
+horizon: 16          # full trajectory length the UNet denoises
+n_obs_steps: 2       # observation context window
+n_action_steps: 8    # actions executed before re-planning
+
+# --- ConditionalUnet1D architecture ---
+# [64, 128, 256] → ~2.5M params (vs 41M with [256, 512, 1024])
+# Plenty of capacity for a 27-dim → 12-dim low-dim task.
+policy:
+  down_dims: [64, 128, 256]
+  kernel_size: 5
+  n_groups: 8
+  diffusion_step_embed_dim: 128
+  cond_predict_scale: false
+  obs_as_global_cond: true
+  obs_as_local_cond: false
+  pred_action_steps_only: false
+
+# --- DDPM noise scheduler ---
+noise_scheduler:
+  num_train_timesteps: 100
+  beta_start: 0.0001
+  beta_end: 0.02
+  beta_schedule: squaredcos_cap_v2
+  variance_type: fixed_small
+  clip_sample: true
+  prediction_type: epsilon
+  num_inference_steps: 100
+
+# --- Training ---
+training:
+  num_epochs: 50
+  batch_size: 64
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-6
+  lr_scheduler: cosine
+  lr_warmup_steps: 100
+  gradient_accumulate_every: 1
+  use_ema: true
+  ema_decay: 0.995
+  seed: 42
+  val_every: 5
+  checkpoint_every: 5
+  max_train_steps: null
+  max_val_steps: null
+
+# --- Dataset ---
+dataset:
+  val_ratio: 0.02
+  max_episodes: null
+
+# --- DataLoader ---
+dataloader:
+  num_workers: 0
+  pin_memory: false
+
+# --- Checkpointing ---
+checkpoint_dir: tmp/cabinet_policy_checkpoints

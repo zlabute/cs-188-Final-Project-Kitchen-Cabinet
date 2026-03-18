@@ -1,33 +1,28 @@
 """
 Step 7: Evaluate a Trained Policy
 ===================================
-Runs a trained policy in the OpenCabinet environment and reports
+Runs a trained diffusion policy in the OpenCabinet environment and reports
 success rate across multiple episodes and kitchen scenes.
 
-Usage:
-    # Evaluate the simple BC policy from Step 6
-    python 07_evaluate_policy.py --checkpoint /tmp/cabinet_policy_checkpoints/best_policy.pt
+The policy is loaded from a checkpoint saved by 09_train_lowdim_unet.py.
+At each timestep the 27-dim observation (robot state + handle features) is
+extracted from the live simulation and fed through the action-chunking
+inference runner.
 
-    # Evaluate with more episodes
+Usage:
+    python 07_evaluate_policy.py --checkpoint tmp/cabinet_policy_checkpoints/best_diffusion_policy.pt
+
     python 07_evaluate_policy.py --checkpoint path/to/policy.pt --num_rollouts 50
 
-    # Evaluate on target (held-out) kitchen scenes
     python 07_evaluate_policy.py --checkpoint path/to/policy.pt --split target
 
-    # Save evaluation videos
-    python 07_evaluate_policy.py --checkpoint path/to/policy.pt --video_path /tmp/eval_videos.mp4
-
-For evaluating official Diffusion Policy / pi-0 / GR00T checkpoints,
-use the evaluation scripts from those repos instead (see 06_train_policy.py).
+    python 07_evaluate_policy.py --checkpoint path/to/policy.pt --video_path tmp/eval_videos.mp4
 """
 
 import argparse
 import os
 import sys
-import time
 
-# Force osmesa (CPU offscreen renderer) on Linux/WSL2 -- EGL requires
-# /dev/dri device access that is unavailable in WSL environments.
 if sys.platform == "linux":
     os.environ.setdefault("MUJOCO_GL", "osmesa")
     os.environ.setdefault("PYOPENGL_PLATFORM", "osmesa")
@@ -37,6 +32,13 @@ import numpy as np
 import robocasa  # noqa: F401
 from robocasa.utils.env_utils import create_env
 
+from cabinet_utils import (
+    HandleFeatureExtractor,
+    DiffusionPolicyRunner,
+    extract_full_obs,
+    load_diffusion_checkpoint,
+)
+
 
 def print_section(title):
     print(f"\n{'=' * 60}")
@@ -44,88 +46,9 @@ def print_section(title):
     print(f"{'=' * 60}")
 
 
-def load_policy(checkpoint_path, device):
-    """Load a trained policy checkpoint."""
-    import torch
-    import torch.nn as nn
-
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-
-    state_dim = checkpoint["state_dim"]
-    action_dim = checkpoint["action_dim"]
-
-    class SimplePolicy(nn.Module):
-        def __init__(self, state_dim, action_dim, hidden_dim=256):
-            super().__init__()
-            self.net = nn.Sequential(
-                nn.Linear(state_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, action_dim),
-                nn.Tanh(),
-            )
-
-        def forward(self, state):
-            return self.net(state)
-
-    model = SimplePolicy(state_dim, action_dim).to(device)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.eval()
-
-    print(f"Loaded policy from: {checkpoint_path}")
-    print(f"  Trained for {checkpoint['epoch']} epochs, loss={checkpoint['loss']:.6f}")
-    print(f"  State dim: {state_dim}, Action dim: {action_dim}")
-
-    return model, state_dim, action_dim
-
-
-def extract_state(obs, state_dim):
-    """Extract a fixed-size state vector from observations."""
-    state_parts = []
-
-    # Gather available state observations in a consistent order
-    state_keys = sorted(
-        k
-        for k in obs.keys()
-        if not k.endswith("_image") and isinstance(obs[k], np.ndarray)
-    )
-
-    for key in state_keys:
-        val = obs[key].flatten()
-        state_parts.append(val)
-
-    if not state_parts:
-        return np.zeros(state_dim, dtype=np.float32)
-
-    state = np.concatenate(state_parts).astype(np.float32)
-
-    # Pad or truncate to match expected state_dim
-    if len(state) < state_dim:
-        state = np.pad(state, (0, state_dim - len(state)))
-    elif len(state) > state_dim:
-        state = state[:state_dim]
-
-    return state
-
-
-def run_evaluation(
-    model,
-    state_dim,
-    action_dim,
-    num_rollouts,
-    max_steps,
-    split,
-    video_path,
-    seed,
-):
+def run_evaluation(policy, cfg, device, num_rollouts, max_steps, split, video_path, seed):
     """Run evaluation rollouts and collect statistics."""
-    import torch
     import imageio
-
-    device = next(model.parameters()).device
 
     env = create_env(
         env_name="OpenCabinet",
@@ -141,28 +64,24 @@ def run_evaluation(
         os.makedirs(os.path.dirname(video_path) or ".", exist_ok=True)
         video_writer = imageio.get_writer(video_path, fps=20)
 
-    results = {
-        "successes": [],
-        "episode_lengths": [],
-        "rewards": [],
-    }
+    results = {"successes": [], "episode_lengths": [], "rewards": []}
 
     for ep in range(num_rollouts):
         obs = env.reset()
         ep_meta = env.get_ep_meta()
         lang = ep_meta.get("lang", "")
 
+        handle_ext = HandleFeatureExtractor(env)
+        runner = DiffusionPolicyRunner(policy, cfg, device)
+        runner.reset()
+
         ep_reward = 0.0
         success = False
 
         for step in range(max_steps):
-            # Extract state and predict action
-            state = extract_state(obs, state_dim)
-            with torch.no_grad():
-                state_tensor = torch.from_numpy(state).unsqueeze(0).to(device)
-                action = model(state_tensor).cpu().numpy().squeeze(0)
+            full_obs = extract_full_obs(obs, handle_ext, env)
+            action = runner.get_action(full_obs, handle_ext, env)
 
-            # Pad action to match environment action dim if needed
             env_action_dim = env.action_dim
             if len(action) < env_action_dim:
                 action = np.pad(action, (0, env_action_dim - len(action)))
@@ -206,7 +125,7 @@ def main():
         "--checkpoint",
         type=str,
         required=True,
-        help="Path to policy checkpoint (.pt file)",
+        help="Path to diffusion policy checkpoint (.pt file from 09_train)",
     )
     parser.add_argument(
         "--num_rollouts", type=int, default=20, help="Number of evaluation episodes"
@@ -222,10 +141,7 @@ def main():
         help="Kitchen scene split to evaluate on",
     )
     parser.add_argument(
-        "--video_path",
-        type=str,
-        default=None,
-        help="Path to save evaluation video (optional)",
+        "--video_path", type=str, default=None, help="Path to save evaluation video"
     )
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
     args = parser.parse_args()
@@ -237,22 +153,20 @@ def main():
         sys.exit(1)
 
     print("=" * 60)
-    print("  OpenCabinet - Policy Evaluation")
+    print("  OpenCabinet - Policy Evaluation (Diffusion UNet)")
     print("=" * 60)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    # Load the trained policy
-    model, state_dim, action_dim = load_policy(args.checkpoint, device)
+    policy, cfg = load_diffusion_checkpoint(args.checkpoint, device)
 
-    # Run evaluation
     print_section(f"Evaluating on {args.split} split ({args.num_rollouts} episodes)")
 
     results = run_evaluation(
-        model=model,
-        state_dim=state_dim,
-        action_dim=action_dim,
+        policy=policy,
+        cfg=cfg,
+        device=device,
         num_rollouts=args.num_rollouts,
         max_steps=args.max_steps,
         split=args.split,
@@ -260,7 +174,6 @@ def main():
         seed=args.seed,
     )
 
-    # Print summary
     print_section("Evaluation Results")
 
     num_success = sum(results["successes"])
@@ -278,7 +191,6 @@ def main():
     if args.video_path:
         print(f"\n  Video saved to: {args.video_path}")
 
-    # Context for expected performance
     print_section("Performance Context")
     print(
         "Expected success rates from the RoboCasa benchmark:\n"
@@ -289,10 +201,6 @@ def main():
         "  Diffusion Policy  |  ~30-60% | ~20-50%\n"
         "  pi-0              |  ~40-70% | ~30-60%\n"
         "  GR00T N1.5        |  ~35-65% | ~25-55%\n"
-        "\n"
-        "Note: The simple MLP policy from Step 6 is not expected to\n"
-        "achieve meaningful success rates. Use the official Diffusion\n"
-        "Policy repo for real results."
     )
 
 
