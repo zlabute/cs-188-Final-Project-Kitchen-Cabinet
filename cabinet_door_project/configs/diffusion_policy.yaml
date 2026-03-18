@@ -4,16 +4,17 @@
 # Used by: 09_train_lowdim_unet.py, 07_evaluate_policy.py,
 #          08_visualize_policy_rollout.py
 #
-# obs_dim  = 16 (robot state) + 11 (handle features) = 27
-# action_dim = 12  (eef_pos 3, eef_rot 3, gripper 1, base 4, ctrl 1)
+# obs_dim  = 7 (eef_pos 3 + eef_quat 4) + 6 (handle feats) = 13
+# action_dim = 7  (active action dims only: arm pos 3, rot 3, gripper 1)
 #
-# Sized for CPU training on a laptop (~2.5M params).
-# For GPU training, scale up down_dims to [256, 512, 1024] and
-# increase batch_size / num_epochs accordingly.
+# Dead/constant dims stripped:
+#   obs:  base_pos(3), base_quat(4), gripper_qpos(2) = 9 dropped
+#         handle_pos(3), handle_xaxis_z(1), hinge_dir(1) = 5 dropped
+#   act:  dims 0-4 always [0,0,0,0,-1] = 5 dropped
 # ---------------------------------------------------------------
 
-obs_dim: 27
-action_dim: 12
+obs_dim: 13
+action_dim: 7
 
 # Temporal horizons (in timesteps @ 20 Hz)
 horizon: 16          # full trajectory length the UNet denoises
@@ -21,8 +22,7 @@ n_obs_steps: 2       # observation context window
 n_action_steps: 8    # actions executed before re-planning
 
 # --- ConditionalUnet1D architecture ---
-# [64, 128, 256] → ~2.5M params (vs 41M with [256, 512, 1024])
-# Plenty of capacity for a 27-dim → 12-dim low-dim task.
+# [64, 128, 256] — plenty of capacity for a 13-dim → 7-dim task.
 policy:
   down_dims: [64, 128, 256]
   kernel_size: 5

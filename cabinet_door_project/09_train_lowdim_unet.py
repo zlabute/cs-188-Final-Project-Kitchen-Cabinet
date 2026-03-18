@@ -5,9 +5,9 @@ Trains a 1-D ConditionalUnet diffusion policy on the augmented
 low-dimensional dataset produced by 05b_augment_handle_data.py.
 
 The policy learns to denoise action trajectories conditioned on a
-short observation window (robot state + handle features = 27 dims),
-producing temporally coherent action *chunks* that are executed
-open-loop before re-planning.
+short observation window (eef state + handle features = 13 dims),
+producing temporally coherent 7-dim action *chunks* that are
+executed open-loop before re-planning.
 
 Usage:
     python 09_train_lowdim_unet.py
@@ -33,6 +33,9 @@ if _DP_ROOT not in sys.path:
 
 from cabinet_utils import (
     HANDLE_OBS_COLS,
+    HANDLE_XAXIS_KEEP,
+    PARQUET_ROBOT_INDICES,
+    ACTIVE_ACTION_INDICES,
     build_diffusion_policy,
     load_config,
 )
@@ -75,10 +78,10 @@ class CabinetAugmentedDataset(BaseLowdimDataset):
     Sliding-window dataset over augmented parquet episodes.
 
     Each sample is a temporal window of length ``horizon``:
-        {'obs': (horizon, obs_dim), 'action': (horizon, action_dim)}
+        {'obs': (horizon, 13), 'action': (horizon, 7)}
 
-    Observations are the concatenation of ``observation.state`` (16) and the
-    five handle feature columns (11) = 27 dims.
+    Observations: eef_pos(3) + eef_quat(4) + handle_to_eef(3) + openness(1) + xaxis_xy(2).
+    Actions: only the 7 active dims (original indices 5-11).
     """
 
     def __init__(
@@ -133,8 +136,8 @@ class CabinetAugmentedDataset(BaseLowdimDataset):
             for start in range(ep_len):
                 self._indices.append((ep_idx, start))
 
-        self.obs_dim = self._episode_obs[0].shape[1] if self._episode_obs else 27
-        self.action_dim = self._episode_act[0].shape[1] if self._episode_act else 12
+        self.obs_dim = self._episode_obs[0].shape[1] if self._episode_obs else 13
+        self.action_dim = self._episode_act[0].shape[1] if self._episode_act else 7
 
         self._val_ratio = val_ratio
         self._max_episodes = max_episodes
@@ -142,17 +145,26 @@ class CabinetAugmentedDataset(BaseLowdimDataset):
 
     @staticmethod
     def _extract_episode(df):
-        """Build (N, obs_dim) and (N, action_dim) arrays from a dataframe."""
-        state_col = "observation.state"
-        action_col = "action"
+        """Build (N, 13) obs and (N, 7) action arrays from a dataframe."""
+        full_state = np.stack(df["observation.state"].values).astype(np.float32)
+        robot_obs = full_state[:, PARQUET_ROBOT_INDICES]  # (N, 7)
 
-        obs_parts = [np.stack(df[state_col].values).astype(np.float32)]
+        handle_parts = []
         for col in HANDLE_OBS_COLS:
-            if col in df.columns:
-                obs_parts.append(np.stack(df[col].values).astype(np.float32))
+            if col not in df.columns:
+                continue
+            arr = np.stack(df[col].values).astype(np.float32)
+            if arr.ndim == 1:
+                arr = arr.reshape(-1, 1)
+            if col == "observation.handle_xaxis":
+                arr = arr[:, :HANDLE_XAXIS_KEEP]
+            handle_parts.append(arr)
 
-        obs = np.concatenate(obs_parts, axis=1)
-        act = np.stack(df[action_col].values).astype(np.float32)
+        obs = np.concatenate([robot_obs] + handle_parts, axis=1)
+
+        full_act = np.stack(df["action"].values).astype(np.float32)
+        act = full_act[:, ACTIVE_ACTION_INDICES]  # (N, 7)
+
         return obs, act
 
     def __len__(self):

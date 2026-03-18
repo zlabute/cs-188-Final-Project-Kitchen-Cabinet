@@ -17,29 +17,45 @@ import torch
 import yaml
 
 # ---------------------------------------------------------------------------
-# Canonical observation key order -- must match parquet column concat order
-# used by the training dataset (CabinetAugmentedDataset).
+# Reduced observation space (13 dims)
+# ---------------------------------------------------------------------------
+# Robot: only eef_pos (3) + eef_quat (4) = 7 dims
+# Handle: handle_to_eef_pos (3) + door_openness (1) + handle_xaxis_xy (2) = 6 dims
+#
+# Dropped from robot (9): base_pos(3), base_quat(4), gripper_qpos(2)
+# Dropped from handle (5): handle_pos(3), handle_xaxis_z(1), hinge_direction(1)
 # ---------------------------------------------------------------------------
 
 ROBOT_OBS_KEYS = [
-    "robot0_base_pos",         # (3,)
-    "robot0_base_quat",        # (4,)
     "robot0_base_to_eef_pos",  # (3,)
     "robot0_base_to_eef_quat", # (4,)
-    "robot0_gripper_qpos",     # (2,)
 ]
-ROBOT_STATE_DIM = 16
+ROBOT_STATE_DIM = 7
+
+PARQUET_ROBOT_INDICES = list(range(7, 14))
 
 HANDLE_OBS_COLS = [
-    "observation.handle_pos",          # (3,)
-    "observation.handle_to_eef_pos",   # (3,)
-    "observation.door_openness",       # (1,)
-    "observation.handle_xaxis",        # (3,)
-    "observation.hinge_direction",     # (1,)
+    "observation.handle_to_eef_pos",   # (3,)  kept in full
+    "observation.door_openness",       # (1,)  kept in full
+    "observation.handle_xaxis",        # (3,)  only first 2 kept (z always 0)
 ]
-HANDLE_FEATURE_DIM = 11
+HANDLE_XAXIS_KEEP = 2
+HANDLE_FEATURE_DIM = 6  # 3 + 1 + 2
 
-FULL_OBS_DIM = ROBOT_STATE_DIM + HANDLE_FEATURE_DIM  # 27
+FULL_OBS_DIM = ROBOT_STATE_DIM + HANDLE_FEATURE_DIM  # 13
+
+# ---------------------------------------------------------------------------
+# Reduced action space (7 dims)
+# ---------------------------------------------------------------------------
+# Parquet actions are 12-dim.  Dims 0-4 are dead constants [0,0,0,0,-1].
+# We train/predict only the 7 active dims (indices 5-11).
+# At inference we reconstruct the full 12-dim vector for env.step().
+# ---------------------------------------------------------------------------
+
+ACTIVE_ACTION_INDICES = [5, 6, 7, 8, 9, 10, 11]
+DEAD_ACTION_FILL = np.array([0.0, 0.0, 0.0, 0.0, -1.0], dtype=np.float32)
+REDUCED_ACTION_DIM = 7
+FULL_ACTION_DIM = 12
 
 
 # ===================================================================
@@ -147,7 +163,7 @@ class HandleFeatureExtractor:
             self.h2j_map = {}
 
     def get_features(self, env) -> np.ndarray:
-        """Return (11,) float32 feature vector."""
+        """Return (6,) float32 feature vector: handle_to_eef(3) + openness(1) + xaxis_xy(2)."""
         mj_model = env.sim.model
         mj_data = env.sim.data
 
@@ -169,13 +185,9 @@ class HandleFeatureExtractor:
         handle_to_eef = (handle_pos - eef_pos).astype(np.float32)
         openness = np.array([per_door[target]], dtype=np.float32)
         xmat = mj_data.body(target).xmat.reshape(3, 3)
-        handle_xaxis = xmat[:, 0].copy().astype(np.float32)
-        hinge_dir = np.array(
-            [get_hinge_direction(target, self.h2j_map, mj_model)],
-            dtype=np.float32,
-        )
+        handle_xaxis_xy = xmat[:2, 0].copy().astype(np.float32)
 
-        return np.concatenate([handle_pos, handle_to_eef, openness, handle_xaxis, hinge_dir])
+        return np.concatenate([handle_to_eef, openness, handle_xaxis_xy])
 
 
 # ===================================================================
@@ -184,8 +196,8 @@ class HandleFeatureExtractor:
 
 def extract_robot_state(obs: dict) -> np.ndarray:
     """
-    Build the 16-dim robot state vector from an env observation dict,
-    in the canonical order matching ``observation.state`` in the parquet.
+    Build the 7-dim robot state vector (eef_pos + eef_quat) from an env
+    observation dict.
     """
     parts = []
     for key in ROBOT_OBS_KEYS:
@@ -197,10 +209,26 @@ def extract_robot_state(obs: dict) -> np.ndarray:
 
 
 def extract_full_obs(obs: dict, handle_extractor: HandleFeatureExtractor, env) -> np.ndarray:
-    """Return the full 27-dim observation vector (robot state + handle features)."""
+    """Return the reduced 13-dim observation vector (robot state + handle features)."""
     robot = extract_robot_state(obs)
     handle = handle_extractor.get_features(env)
     return np.concatenate([robot, handle]).astype(np.float32)
+
+
+def reconstruct_full_action(reduced_action: np.ndarray) -> np.ndarray:
+    """
+    Expand a 7-dim reduced action (arm 6 + gripper 1) back to the 12-dim
+    env action expected by the composite controller.
+
+    Parquet stores actions reordered (dead dims first), but env.step()
+    expects: arm(6) + gripper(1) + base(3) + torso(1) + ctrl_mode(1).
+    """
+    full = np.zeros(FULL_ACTION_DIM, dtype=np.float32)
+    full[:7] = reduced_action       # arm(6) + gripper(1) at env positions 0-6
+    # full[7:10] = 0.0              # base — already zero
+    # full[10]   = 0.0              # torso — already zero
+    full[11] = -1.0                 # ctrl_mode = arm control
+    return full
 
 
 # ===================================================================
@@ -349,14 +377,10 @@ class DiffusionPolicyRunner:
     def get_action(self, obs: np.ndarray, handle_extractor: HandleFeatureExtractor,
                    env) -> np.ndarray:
         """
-        Return a single (action_dim,) action for one environment step.
+        Return a single (12,) full env action for one environment step.
 
-        Parameters
-        ----------
-        obs : np.ndarray
-            Raw environment observation dict has already been converted to
-            the full 27-dim vector via ``extract_full_obs`` by the caller,
-            *or* the caller passes the raw dict and we do it here.
+        The policy predicts 7 reduced-dim actions; this method reconstructs
+        the full 12-dim action by reinserting the 5 dead constants.
         """
         if isinstance(obs, dict):
             obs = extract_full_obs(obs, handle_extractor, env)
@@ -368,11 +392,12 @@ class DiffusionPolicyRunner:
             with torch.no_grad():
                 obs_dict = {"obs": obs_seq.unsqueeze(0).to(self.device)}
                 result = self.policy.predict_action(obs_dict)
-            actions = result["action"].cpu().numpy().squeeze(0)  # (n_action_steps, Da)
+            actions = result["action"].cpu().numpy().squeeze(0)  # (n_action_steps, 7)
             for a in actions:
                 self.action_queue.append(a)
 
-        return self.action_queue.popleft()
+        reduced = self.action_queue.popleft()
+        return reconstruct_full_action(reduced)
 
     def _build_obs_tensor(self) -> torch.Tensor:
         """Pad / stack the observation buffer to (n_obs_steps, obs_dim)."""
