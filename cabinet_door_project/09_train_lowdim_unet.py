@@ -235,12 +235,17 @@ def train(cfg: dict):
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     print(f"Device: {device}")
 
     # ---- Dataset ----
     print_section("Loading augmented dataset")
-    dataset_path = _get_dataset_path()
+    dataset_path = cfg.pop("_dataset_path_override", None) or _get_dataset_path()
     print(f"Dataset root: {dataset_path}")
 
     dcfg = cfg.get("dataset", {})
@@ -463,6 +468,13 @@ def main():
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--checkpoint_dir", type=str, default=None)
+    parser.add_argument(
+        "--dataset_path",
+        type=str,
+        default=None,
+        help="Direct path to dataset root (skips robocasa lookup). "
+             "The augmented/ subfolder must exist inside this path.",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -475,6 +487,8 @@ def main():
         cfg["training"]["learning_rate"] = args.lr
     if args.checkpoint_dir is not None:
         cfg["checkpoint_dir"] = args.checkpoint_dir
+    if args.dataset_path is not None:
+        cfg["_dataset_path_override"] = args.dataset_path
 
     print("=" * 60)
     print("  OpenCabinet - Diffusion UNet Low-Dim Training")

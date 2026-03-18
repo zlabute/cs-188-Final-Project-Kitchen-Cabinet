@@ -46,15 +46,15 @@ noise_scheduler:
 
 # --- Training ---
 training:
-  num_epochs: 50
+  num_epochs: 100
   batch_size: 64
   learning_rate: 1.0e-4
-  weight_decay: 1.0e-6
+  weight_decay: 1.0e-4
   lr_scheduler: cosine
   lr_warmup_steps: 100
   gradient_accumulate_every: 1
   use_ema: true
-  ema_decay: 0.995
+  ema_decay: 0.999
   seed: 42
   val_every: 5
   checkpoint_every: 5
@@ -63,7 +63,7 @@ training:
 
 # --- Dataset ---
 dataset:
-  val_ratio: 0.02
+  val_ratio: 0.10
   max_episodes: null
 
 # --- DataLoader ---
@@ -72,4 +72,4 @@ dataloader:
   pin_memory: false
 
 # --- Checkpointing ---
-checkpoint_dir: tmp/cabinet_policy_checkpoints
+checkpoint_dir: tmp/cabinet_policy_checkpoints/normalized_experiment

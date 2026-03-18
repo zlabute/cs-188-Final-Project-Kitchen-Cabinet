@@ -37,6 +37,7 @@ from cabinet_utils import (
     DiffusionPolicyRunner,
     extract_full_obs,
     load_diffusion_checkpoint,
+    check_any_door_open,
 )
 
 
@@ -98,7 +99,7 @@ def run_evaluation(policy, cfg, device, num_rollouts, max_steps, split, video_pa
                 )[::-1]
                 video_writer.append_data(frame)
 
-            if env._check_success():
+            if check_any_door_open(handle_ext, env):
                 success = True
                 break
 
@@ -161,7 +162,12 @@ def main():
     print("  OpenCabinet - Policy Evaluation (Diffusion UNet)")
     print("=" * 60)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     print(f"Device: {device}")
 
     policy, cfg = load_diffusion_checkpoint(args.checkpoint, device)

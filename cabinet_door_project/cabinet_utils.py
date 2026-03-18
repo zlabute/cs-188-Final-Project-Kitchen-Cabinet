@@ -136,6 +136,19 @@ def get_hinge_direction(handle_body, handle_to_joint_map, model):
 # ===================================================================
 
 OPEN_THRESHOLD = 0.90
+SINGLE_DOOR_SUCCESS_THRESHOLD = 0.20
+
+
+def check_any_door_open(handle_extractor, env, threshold=SINGLE_DOOR_SUCCESS_THRESHOLD):
+    """Return True if *any* individual door on the fixture is open past threshold."""
+    mj_model = env.sim.model
+    mj_data = env.sim.data
+    for hb in handle_extractor.handle_bodies:
+        joints = handle_extractor.h2j_map.get(hb, [])
+        openness = compute_door_openness(mj_model, mj_data, joints)
+        if openness >= threshold:
+            return True
+    return False
 
 
 class HandleFeatureExtractor:

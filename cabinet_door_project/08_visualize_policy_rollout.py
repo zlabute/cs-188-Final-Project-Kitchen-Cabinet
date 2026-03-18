@@ -65,6 +65,7 @@ from cabinet_utils import (
     DiffusionPolicyRunner,
     extract_full_obs,
     load_diffusion_checkpoint,
+    check_any_door_open,
 )
 
 
@@ -120,7 +121,7 @@ def run_onscreen(policy, cfg, device, args):
             obs, reward, done, info = env.step(action)
 
             if step % 20 == 0:
-                checking = env._check_success()
+                checking = check_any_door_open(handle_ext, env)
                 status = "cabinet OPEN" if checking else "in progress"
                 act_mag = float(np.abs(action).mean())
                 print(
@@ -128,7 +129,7 @@ def run_onscreen(policy, cfg, device, args):
                     f"action_mag={act_mag:.3f}  [{status}]"
                 )
 
-            if env._check_success():
+            if check_any_door_open(handle_ext, env):
                 hold_count += 1
                 if hold_count >= 15:
                     success = True
@@ -207,11 +208,11 @@ def run_offscreen(policy, cfg, device, args):
             ep_frames.append(frame)
 
             if step % 20 == 0:
-                checking = env._check_success()
+                checking = check_any_door_open(handle_ext, env)
                 status = "cabinet OPEN" if checking else "in progress"
                 print(f"  step {step:4d}  reward={reward:+.3f}  [{status}]")
 
-            if env._check_success():
+            if check_any_door_open(handle_ext, env):
                 hold_count += 1
                 if hold_count >= 15:
                     success = True
@@ -295,7 +296,12 @@ def main():
         print("Train a policy first with:  python 09_train_lowdim_unet.py")
         sys.exit(1)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     policy, cfg = load_diffusion_checkpoint(args.checkpoint, device)
 
     print(f"Checkpoint: {args.checkpoint}")
