@@ -46,7 +46,7 @@ def print_section(title):
     print(f"{'=' * 60}")
 
 
-def run_evaluation(policy, cfg, device, num_rollouts, max_steps, split, video_path, seed):
+def run_evaluation(policy, cfg, device, num_rollouts, max_steps, split, video_path, seed, action_scale=1.0):
     """Run evaluation rollouts and collect statistics."""
     import imageio
 
@@ -88,6 +88,7 @@ def run_evaluation(policy, cfg, device, num_rollouts, max_steps, split, video_pa
             elif len(action) > env_action_dim:
                 action = action[:env_action_dim]
 
+            action = action * action_scale
             obs, reward, done, info = env.step(action)
             ep_reward += reward
 
@@ -144,6 +145,10 @@ def main():
         "--video_path", type=str, default=None, help="Path to save evaluation video"
     )
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
+    parser.add_argument(
+        "--action_scale", type=float, default=1.0,
+        help="Multiply actions by this factor before env.step (e.g. 0.5 to halve)",
+    )
     args = parser.parse_args()
 
     try:
@@ -172,6 +177,7 @@ def main():
         split=args.split,
         video_path=args.video_path,
         seed=args.seed,
+        action_scale=args.action_scale,
     )
 
     print_section("Evaluation Results")

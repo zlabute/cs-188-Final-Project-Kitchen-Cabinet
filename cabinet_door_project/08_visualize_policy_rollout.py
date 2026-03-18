@@ -116,6 +116,7 @@ def run_onscreen(policy, cfg, device, args):
             elif len(action) > env_dim:
                 action = action[:env_dim]
 
+            action = action * args.action_scale
             obs, reward, done, info = env.step(action)
 
             if step % 20 == 0:
@@ -197,6 +198,7 @@ def run_offscreen(policy, cfg, device, args):
             elif len(action) > env_dim:
                 action = action[:env_dim]
 
+            action = action * args.action_scale
             obs, reward, done, info = env.step(action)
 
             frame = env.sim.render(
@@ -271,6 +273,10 @@ def main():
         help="On-screen playback rate cap (frames/second); lower = slower",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument(
+        "--action_scale", type=float, default=1.0,
+        help="Multiply actions by this factor before env.step (e.g. 0.5 to halve)",
+    )
     args = parser.parse_args()
 
     print("=" * 60)
