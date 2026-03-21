@@ -23,3 +23,6 @@ uv.lock
 # Runs
 tmp/
 diffusion_policy/
+test_epochs/
+augmented_data.zip
+runs_record_manual.md

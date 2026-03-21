@@ -55,7 +55,7 @@ cd cabinet_door_project
 python 00_verify_installation.py
 ```
 
-> **macOS note:** Scripts that open a rendering window (03, 05) require
+> **macOS note:** Scripts that open a rendering window (03, 05, 08) require
 > `mjpython` instead of `python`. The install script will remind you of this.
 
 ---
@@ -64,20 +64,25 @@ python 00_verify_installation.py
 
 ```
 cabinet_door_project/
-  00_verify_installation.py      # Check that everything is installed correctly
-  01_explore_environment.py      # Create the OpenCabinet env, inspect observations/actions
-  02_random_rollouts.py          # Run random actions, save video, understand the task
-  03_teleop_collect_demos.py     # Teleoperate the robot to collect your own demonstrations
-  04_download_dataset.py         # Download the pre-collected OpenCabinet dataset
-  05_playback_demonstrations.py  # Play back demonstrations to see expert behavior
-  06_train_policy.py             # Train a simple MLP behavior-cloning policy
-  07_evaluate_policy.py          # Evaluate your trained policy in simulation
-  08_visualize_policy_rollout.py # Visualize a rollout of your policy in RoboCasa
+  00_verify_installation.py        # Check that everything is installed correctly
+  01_explore_environment.py        # Create the OpenCabinet env, inspect observations/actions
+  02_random_rollouts.py            # Run random actions, save video, understand the task
+  03_teleop_collect_demos.py       # Teleoperate the robot to collect your own demonstrations
+  04_download_dataset.py           # Download the pre-collected OpenCabinet dataset
+  05_playback_demonstrations.py    # Play back demonstrations to see expert behavior
+  05b_augment_handle_data.py       # Augment dataset with handle position & door features
+  06_train_policy.py               # Train a simple MLP behavior-cloning policy (baseline)
+  07_evaluate_policy.py            # Evaluate your trained policy in simulation
+  08_visualize_policy_rollout.py   # Visualize a rollout of your policy in RoboCasa
+  09_train_lowdim_unet.py          # Train a diffusion policy (ConditionalUnet1D)
+  cabinet_utils.py                 # Shared utilities (handle extraction, policy construction)
   configs/
-    diffusion_policy.yaml        # Training hyperparameters
-  notebook.ipynb                 # Interactive Jupyter notebook companion
-install.sh                       # Installation script (macOS + WSL/Linux)
-README.md                        # This file
+    diffusion_policy.yaml          # Diffusion policy hyperparameters
+  figures/                         # Generated plots and diagrams
+  plot_generators/                 # Scripts to regenerate figures
+  notebook.ipynb                   # Interactive Jupyter notebook companion
+install.sh                         # Installation script (macOS + WSL/Linux)
+README.md                          # This file
 ```
 
 ---
@@ -161,7 +166,24 @@ python 05_playback_demonstrations.py
 Visualize the downloaded demonstrations to see how an expert opens cabinet
 doors. This is the data your policy will learn from.
 
-### Step 6: Train a Policy
+### Step 5b: Augment the Dataset with Handle Features
+
+```bash
+python 05b_augment_handle_data.py
+```
+
+Replays the saved MuJoCo states from the demonstration dataset to extract
+handle position, door openness, and other features the robot needs. It writes
+augmented parquet files alongside the originals.
+
+Output: an `augmented/` directory inside the dataset folder containing one
+parquet file per episode, each with the original columns plus 5 new
+observation columns (11 extra dims total).
+
+You only need to run this once. If you already have the augmented parquet
+files, skip this step.
+
+### Step 6: Train a Baseline Policy
 
 ```bash
 python 06_train_policy.py
@@ -172,30 +194,110 @@ pairs from the demonstration data. This is meant to illustrate the
 data-loading → training → checkpoint pipeline, not to produce a policy that
 can reliably solve the task.
 
-For a policy that actually works, use one of the official training repos:
+---
 
-```bash
-# Diffusion Policy (recommended for single-task)
-git clone https://github.com/robocasa-benchmark/diffusion_policy
-cd diffusion_policy && pip install -e .
-python train.py --config-name=train_diffusion_transformer_bs192 task=robocasa/OpenCabinet
+## Diffusion Policy Pipeline
+
+The main training approach uses a diffusion policy (ConditionalUnet1D) trained
+on the augmented low-dimensional dataset. All commands are run from the
+`cabinet_door_project/` directory with the virtual environment active.
+
+```
+Step 5b   05b_augment_handle_data.py       Add handle features to parquet (run once)
+   |
+Step 9    09_train_lowdim_unet.py          Train the diffusion policy
+   |
+Step 7    07_evaluate_policy.py            Evaluate success rate
+   |
+Step 8    08_visualize_policy_rollout.py   Watch the robot
 ```
 
-You can also print setup instructions for Diffusion Policy, pi-0, and GR00T
-directly from the script:
+### Train the Diffusion Policy
 
 ```bash
-python 06_train_policy.py --use_diffusion_policy
+# Default (uses configs/diffusion_policy.yaml)
+python 09_train_lowdim_unet.py
+
+# Override hyperparameters from the command line
+python 09_train_lowdim_unet.py --epochs 100 --batch_size 64
+python 09_train_lowdim_unet.py --lr 3e-4
+python 09_train_lowdim_unet.py --checkpoint_dir ./my_checkpoints
 ```
 
-### Step 7: Evaluate Your Policy
+#### What gets saved
+
+| File | Description |
+|------|-------------|
+| `best_diffusion_policy.pt` | Best checkpoint by validation loss |
+| `final_diffusion_policy.pt` | Checkpoint at the end of training |
+| `checkpoint_epoch_XXXXX.pt` | Periodic checkpoints (every N epochs) |
+
+Each checkpoint contains the full policy weights, normalizer state, optimizer
+state, and the config dict so it is fully self-contained.
+
+#### Key config parameters (`configs/diffusion_policy.yaml`)
+
+| Parameter | Default | What it does |
+|-----------|---------|--------------|
+| `horizon` | 16 | Trajectory length the UNet denoises (timesteps) |
+| `n_obs_steps` | 2 | Number of past observations used as context |
+| `n_action_steps` | 8 | Number of actions executed before re-planning |
+| `training.num_epochs` | 100 | Total training epochs |
+| `training.batch_size` | 64 | Batch size (reduce if you run out of memory) |
+| `training.learning_rate` | 1e-4 | Learning rate (cosine decay) |
+| `training.use_ema` | true | Exponential Moving Average of weights |
+| `noise_scheduler.num_train_timesteps` | 100 | DDPM diffusion steps |
+
+### Evaluate the Policy
 
 ```bash
-python 07_evaluate_policy.py --checkpoint path/to/checkpoint.pt
+# Basic evaluation (20 episodes on pretrain kitchens)
+python 07_evaluate_policy.py \
+    --checkpoint tmp/cabinet_policy_checkpoints/best_diffusion_policy.pt
+
+# More episodes for a reliable success rate
+python 07_evaluate_policy.py \
+    --checkpoint tmp/cabinet_policy_checkpoints/best_diffusion_policy.pt \
+    --num_rollouts 50
+
+# Evaluate on held-out kitchen scenes
+python 07_evaluate_policy.py \
+    --checkpoint tmp/cabinet_policy_checkpoints/best_diffusion_policy.pt \
+    --split target
 ```
 
-Runs your trained policy in the simulation environment and reports success
-rate across multiple episodes and kitchen scenes.
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--checkpoint` | (required) | Path to `.pt` checkpoint |
+| `--num_rollouts` | 20 | Number of episodes to run |
+| `--max_steps` | 500 | Max timesteps per episode |
+| `--split` | `pretrain` | `pretrain` or `target` (held-out kitchens) |
+| `--video_path` | None | If set, saves an MP4 of the evaluation |
+| `--seed` | 0 | Random seed for environment layout |
+
+### Visualize the Policy
+
+```bash
+# On-screen (interactive viewer window)
+# macOS: use mjpython instead of python
+mjpython 08_visualize_policy_rollout.py \
+    --checkpoint tmp/cabinet_policy_checkpoints/best_diffusion_policy.pt
+
+# Off-screen (headless, saves video)
+python 08_visualize_policy_rollout.py \
+    --checkpoint tmp/cabinet_policy_checkpoints/best_diffusion_policy.pt \
+    --offscreen --video_path tmp/my_rollout.mp4
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--checkpoint` | `best_diffusion_policy.pt` | Path to `.pt` checkpoint |
+| `--num_episodes` | 1 | Episodes to run |
+| `--max_steps` | 300 | Max timesteps per episode |
+| `--offscreen` | off | Render to video instead of viewer window |
+| `--video_path` | `tmp/policy_rollout.mp4` | Output video path |
+| `--fps` | 20 | Video frames per second |
+| `--seed` | 42 | Random seed |
 
 ---
 
@@ -241,7 +343,7 @@ dataset/
   meta/           # Episode metadata (task descriptions, camera info)
   videos/         # MP4 videos from each camera
   data/           # Parquet files with actions, states, rewards
-  extras/         # Per-episode metadata
+  extras/         # Per-episode metadata (MuJoCo states, model XML)
 ```
 
 ---
@@ -339,6 +441,25 @@ I'll continually update this section as students find bugs in the system. Please
 | `GLFW error` on headless server | Set `export MUJOCO_GL=egl` or `osmesa` |
 | Out of GPU memory during training | Reduce batch size in `configs/diffusion_policy.yaml` |
 | Kitchen assets not found | Run `python -m robocasa.scripts.download_kitchen_assets` |
+| `FileNotFoundError: Augmented data not found` | Run `python 05b_augment_handle_data.py` first |
+| `FileNotFoundError: Dataset not found` | Run `python 04_download_dataset.py` first |
+| Training loss is NaN | Lower learning rate (try `--lr 5e-5`) |
+| Very slow training on CPU | Expected. Use a GPU if available, or reduce `--epochs` |
+
+---
+
+## File Reference
+
+| File | Purpose |
+|------|---------|
+| `cabinet_utils.py` | Shared utilities (handle extraction, policy construction, inference runner) |
+| `configs/diffusion_policy.yaml` | All hyperparameters for diffusion policy training |
+| `05b_augment_handle_data.py` | One-time data augmentation (handle + door features) |
+| `09_train_lowdim_unet.py` | Diffusion policy training script |
+| `07_evaluate_policy.py` | Quantitative evaluation (success rate) |
+| `08_visualize_policy_rollout.py` | Visual debugging (viewer or video) |
+| `plot_generators/` | Scripts to regenerate figures (training curves, architecture, etc.) |
+| `figures/` | Generated plots and diagrams |
 
 ---
 
